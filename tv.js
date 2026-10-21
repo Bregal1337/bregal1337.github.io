@@ -7,7 +7,7 @@
   if (window.tvt_plugin_ready) return;
   window.tvt_plugin_ready = true;
 
-  var VERSION = '1.12.0';
+  var VERSION = '1.14.0';
 
   // ---------------------------------------------------------------------------
   // Разбор названия раздачи
@@ -272,19 +272,42 @@
     return 'Серии ' + m[1].replace(/\s+/g, '').replace('-', '–') + (m[2] ? ' из ' + m[2] : '');
   }
 
-  // Диапазон серий в раздаче: «серии 1-13 из 23» → [1, 13]
+  // Диапазон серий в раздаче: «серии 1-13 из 23» → [1, 13]; «[ТВ-2, часть 4] (1—8)» → [1, 8]
   function parseEpisodeRange(lower) {
-    var m = lower.match(/(\d{1,4})\s*[-–]\s*(\d{1,4})\s*(?:серии|серия|эпизоды)?\s*из\s*\d{1,4}/) ||
-      lower.match(/серии:?\s*(\d{1,4})\s*[-–]\s*(\d{1,4})/) ||
-      lower.match(/\d{1,2}x(\d{1,3})\s*[-–]\s*(\d{1,3})/) ||
-      lower.match(/\be(\d{1,3})\s*[-–]\s*e?(\d{1,3})\b/);
+    var m = lower.match(/(\d{1,4})\s*[-–—]\s*(\d{1,4})\s*(?:серии|серия|серий|эпизоды)?\s*из\s*\d{1,4}/) ||
+      lower.match(/серии:?\s*(\d{1,4})\s*[-–—]\s*(\d{1,4})/) ||
+      // «(1 сезон: 208-242 серии)» — без «из»
+      lower.match(/(\d{1,4})\s*[-–—]\s*(\d{1,4})\s*(?:серии|серия|серий|эпизоды)(?![а-яё])/) ||
+      lower.match(/\d{1,2}x(\d{1,3})\s*[-–—]\s*(\d{1,3})/) ||
+      lower.match(/\be(\d{1,3})\s*[-–—]\s*e?(\d{1,3})\b/) ||
+      lower.match(/\((\d{1,3})\s*[-–—]\s*(\d{1,3})\)/) ||
+      // «One Piece [1061-1118]», «[1021-1060 +3SP]», но не годы «[2022-2024]»
+      lower.match(/\[(\d{1,4})\s*[-–—]\s*(\d{1,4})(?:\s*\+[^\]]*)?\]/);
 
     if (!m) return null;
 
     var from = parseInt(m[1], 10);
     var to = parseInt(m[2], 10);
 
+    if (from >= 1900 && from <= 2100) return null;
+
     return to >= from ? [from, to] : null;
+  }
+
+  // Части сезона: «2 сезон: Часть 2», «[ТВ-2, часть 3]», «Части 1-3», «Season 3 Part 2», «2nd Cour» → [с, по]
+  function parseParts(lower) {
+    var m = lower.match(/част[иь]\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})(?!\d)/) ||
+      lower.match(/\bparts?\s*(\d{1,2})\s*[-–—]\s*(\d{1,2})\b/);
+
+    if (m && +m[2] >= +m[1]) return [+m[1], +m[2]];
+
+    m = lower.match(/част[ьи]\s*(\d{1,2})(?!\d)/) ||
+      lower.match(/(?:^|[^\d])(\d{1,2})\s*[-–]?\s*(?:я\s+)?часть/) ||
+      lower.match(/\bpart\s*(\d{1,2})\b/) ||
+      lower.match(/\b(\d{1,2})(?:st|nd|rd|th)\s+(?:part|cour)\b/) ||
+      lower.match(/\bcour\s*(\d{1,2})\b/);
+
+    return m && +m[1] > 0 ? [+m[1], +m[1]] : null;
   }
 
   // Слова в названиях звуковых дорожек, которые не являются студией
@@ -525,6 +548,7 @@
     r.total = parseTotal(lower);
     r.episodes = parseEpisodes(lower);
     r.ep_range = parseEpisodeRange(lower);
+    r.parts = parseParts(lower);
 
     return r;
   }
@@ -1676,6 +1700,142 @@
     return split ? split.list : tmdbSeasons(movie);
   }
 
+  function coversSeason(it, n) {
+    return it.r.seasons.indexOf(n) >= 0;
+  }
+
+  function seasonOf(movie, n) {
+    return realSeasons(movie).filter(function (s) { return s.season_number === n; })[0] || null;
+  }
+
+  // Какие серии сезона n есть в раздаче: [с, по] в нумерации экрана или null — неизвестно (весь сезон).
+  // Раздача части считает серии с начала части: «2 сезон: Часть 2: 1-13 серии из 13» — это 14–26-я
+  // серии сезона, а «Части 1-3: 1-40 серии» — с начала сезона
+  function releaseSpan(movie, it, n) {
+    var r = it.r;
+    var range = r.ep_range && r.seasons.length <= 1 ? r.ep_range : null;
+    var season = movie && n ? seasonOf(movie, n) : null;
+    var parts = season && season.parts || [];
+
+    // Номера больше, чем серий в сезоне, — сквозные («Ван-Пис [1061-1118]», «Блич [168-366 из 366]»,
+    // «Gintama TV-2 [202-252]»): переводим в номера этого сезона, вне сезона — раздача его не содержит.
+    // Раздача сезона с номерами от 1 («2 сезон: 1-18 серии из 18» при 7 сериях на TMDB) — свой счёт сезонов, не сквозной
+    if (range && season && range[1] > season.episode_count && !r.parts && (!r.seasons.length || range[0] > season.episode_count)) {
+      var before = 0;
+
+      realSeasons(movie).some(function (s) {
+        if (s.season_number === n) return true;
+        before += s.episode_count;
+      });
+
+      var a0 = Math.max(1, range[0] - before);
+      var b0 = Math.min(season.episode_count, range[1] - before);
+
+      return a0 <= b0 ? [a0, b0] : [0, -1];
+    }
+
+    if (!r.parts || parts.length < 2 || r.seasons.length > 1) return range;
+
+    var a = parts[r.parts[0] - 1];
+    var b = parts[Math.min(r.parts[1], parts.length) - 1];
+
+    if (!a || !b) return range;
+    if (!range) return [a.from, b.to];
+    if (range[1] <= b.to - a.from + 1) return [a.from + range[0] - 1, a.from + range[1] - 1];
+
+    return range;
+  }
+
+  function coversEpisode(it, e, movie, n) {
+    var span = releaseSpan(movie, it, n);
+
+    return span ? e >= span[0] && e <= span[1] : true;
+  }
+
+  // Годы раздачи не попадают в годы сезона — это другое произведение или другая нумерация сезонов
+  // («Блич 2 сезон (1-21 из 21) / 2005» — арка старого сериала, а 2 сезон «Блича» — 2022–2026)
+  function seasonYears(movie, n) {
+    var list = realSeasons(movie);
+    var yearOf = function (d) { return parseInt((d || '').slice(0, 4), 10) || 0; };
+
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+
+      if (s.season_number !== n) continue;
+
+      var eps = (s.episodes || []).filter(function (x) { return x.air_date; });
+      var from = yearOf(eps.length ? eps[0].air_date : s.air_date);
+      var to = eps.length ? yearOf(eps[eps.length - 1].air_date) : list[i + 1] ? yearOf(list[i + 1].air_date) : 0;
+
+      return from ? [from, Math.max(from, to || new Date().getFullYear())] : null;
+    }
+
+    return null;
+  }
+
+  // Фильм: раздачи другого года («Коллекция 2002-2016» для фильма 2026) и сезоны
+  // одноимённого сериала не предлагаем
+  function movieReleases(items, year) {
+    var same = items.filter(function (it) { return yearMatches(it.r, year) && !it.r.seasons.length; });
+    var all = same.length ? same : items;
+    var list = all.filter(function (it) { return !it.r.cam; });
+
+    return list.length ? list : all.slice();
+  }
+
+  // Раздачи сезона n сериала
+  function seasonReleases(movie, items, n) {
+    var list = items.filter(function (it) { return !it.r.cam; });
+
+    if (!list.length) list = items.slice();
+
+    // Раздачи с годами вне лет выхода — другое произведение с тем же названием
+    // (фильм «Тетрадь смерти» 2017 года у сериала 2006–2007)
+    // Конец — по последнему сезону и следующей серии: TMDB обновляет last_air_date с опозданием
+    // («Киберпанк: Бегущие по краю», 2 сезон вышел в 2026, а last_air_date ещё 2022); идущий сериал — до этого года
+    var yearOf = function (d) { return parseInt((d || '').slice(0, 4), 10) || 0; };
+    var y0 = yearOf(movie.first_air_date);
+    var y1 = Math.max(yearOf(movie.last_air_date), yearOf(movie.next_episode_to_air && movie.next_episode_to_air.air_date));
+
+    (movie.seasons || []).forEach(function (s) { y1 = Math.max(y1, yearOf(s.air_date)); });
+
+    if (!y1 || movie.in_production || /returning|production|planned/i.test(movie.status || '')) y1 = Math.max(y1, new Date().getFullYear());
+
+    if (y0) {
+      var in_years = list.filter(function (it) {
+        return !it.r.years.length || it.r.years.some(function (y) { return y[1] >= y0 - 1 && y[0] <= y1 + 1; });
+      });
+
+      if (in_years.length) list = in_years;
+    }
+
+    var exact = list.filter(function (it) { return coversSeason(it, n); });
+    var unnamed = list.filter(function (it) { return !it.r.seasons.length; });
+    var years = isAnimation(movie) ? seasonYears(movie, n) : null;
+
+    // Раздачи нескольких сезонов часто подписаны годом начала сериала («1-2 сезоны … / 2019») — их не трогаем
+    if (years) {
+      var in_season = exact.filter(function (it) {
+        return it.r.seasons.length > 1 || !it.r.years.length || it.r.years.some(function (y) { return y[1] >= years[0] - 1 && y[0] <= years[1] + 1; });
+      });
+
+      if (in_season.length) exact = in_season;
+    }
+
+    // Сезон в названии не указан: у односезонного сериала это тот же сезон — берём вместе с «[S01]»
+    // («Тетрадь смерти»: одна раздача с S01 и полсотни «1-37 из 37»), у многосезонного — запасной вариант
+    var out = realSeasons(movie).length <= 1 ? exact.concat(unnamed) : exact.length ? exact : unnamed;
+
+    // Серии раздачи все вне сезона («Ван-Пис [1061-1118]» для 3 сезона) — не предлагаем
+    var inside = out.filter(function (it) {
+      var span = releaseSpan(movie, it, n);
+
+      return !span || span[0] <= span[1];
+    });
+
+    return inside.length ? inside : out;
+  }
+
   // ---------------------------------------------------------------------------
   // Аниме: TMDB одни тайтлы делит на сезоны как трекеры, а другие держит одним сезоном
   // («Магическая битва»: 1 сезон, 59 серий; на трекерах «1 сезон» 24, «2 сезон» 23, «3 сезон» 12).
@@ -1934,6 +2094,320 @@
     return changed ? out : null;
   }
 
+  // ---------------------------------------------------------------------------
+  // Аниме с данными Shikimori (anime.js, window.tvt_units): там каждая часть сериала — отдельный тайтл
+  // с числом серий и датой выхода, а карта аниме знает, какой это сезон у трекеров. Серии TMDB
+  // раскладываем по тайтлам по датам выхода; тайтлы одного сезона — его части («Блич», 2 сезон:
+  // четыре части по 13, 13, 14 и 10 серий, у трекеров — «2 сезон: Часть 2: 1-13 серии из 13»).
+  // Сезон TMDB режем, если в нём несколько сезонов; два сезона TMDB в один не склеиваем.
+  // ---------------------------------------------------------------------------
+
+  var DAY = 86400000;
+
+  function dayTime(d) {
+    var t = d ? Date.parse(d) : NaN;
+
+    return isNaN(t) ? 0 : t;
+  }
+
+  // «Bleach: Sennen Kessen-hen - Ketsubetsu-tan», «Атака титанов 3. Часть 2» — часть тайтла head;
+  // «Jujutsu Kaisen 2nd Season», «Mushoku Tensei II» — новый сезон
+  function isPartName(name, head) {
+    var norm = function (s) { return (s || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim(); };
+    var n = norm(name);
+    var h = norm(head);
+
+    if (!n || !h || n === h || n.indexOf(h) !== 0) return false;
+
+    var rest = n.slice(h.length);
+
+    if (/^\s*[:.]?\s*(?:season|сезон)|^\s*\d|^\s+(?:ii|iii|iv|v|vi)\b/.test(rest)) return false;
+
+    return /^\s*[-–—]\s*\S|^\s*[:.]?\s*(?:part|часть|cour)\s*\d|^\s+(?:\d+(?:st|nd|rd|th)\s+)?(?:part|cour)\b/.test(rest);
+  }
+
+  // Название части без названия сериала: «Блич: Тысячелетняя кровавая война — Прощание» → «Прощание»
+  function partTitle(u, head) {
+    var n = u.russian || u.name;
+    var h = head.russian || head.name;
+
+    if (u === head || !n) return '';
+    if (h && n.indexOf(h) === 0) n = n.slice(h.length);
+
+    return n.replace(/^[\s.:,–—-]+/, '').replace(/^(?:часть|part)\s*\d+[\s.:,–—-]*/i, '').trim();
+  }
+
+  // → список сезонов (как у splitSeasons, у сезонов из нескольких частей ещё parts),
+  // 'tmdb' — сезоны как на TMDB, null — тайтлы Shikimori с сериями TMDB не сходятся
+  function unitSeasons(movie, data, units) {
+    var tmdb = tmdbSeasons(movie);
+    var flat = [];
+
+    for (var ti = 0; ti < tmdb.length; ti++) {
+      var t = tmdb[ti];
+      var json = data[t.season_number] || data[t.season_number + ''];
+      var list = tmdbEpisodes(json).filter(function (e) { return e.episode_number > 0; });
+
+      if (!list.length) return null;
+
+      list.sort(function (a, b) { return a.episode_number - b.episode_number; });
+      list.forEach(function (ep) { flat.push({ ep: ep, t: t }); });
+    }
+
+    var now = Date.now();
+    var fresh = function (u) { var a = dayTime(u.aired); return a && a <= now + DAY; };
+    var base = (units || []).filter(function (u) { return !u.extra && fresh(u); });
+    var extra = (units || []).filter(function (u) { return u.extra && fresh(u); });
+
+    if (!base.length || !flat.length) return null;
+
+    // Первая серия тайтла: первая ещё не разложенная серия TMDB, вышедшая не раньше тайтла (±3 дня)
+    var startOf = function (u, from) {
+      var a = dayTime(u.aired) - 3 * DAY;
+
+      for (var i = from; i < flat.length; i++) {
+        var at = airTime(flat[i].ep);
+
+        if (!at || at >= a) return i;
+      }
+
+      return flat.length;
+    };
+
+    var spans = [];
+    var align = function (list, from) {
+      var p = from;
+
+      for (var k = 0; k < list.length; k++) {
+        var u = list[k];
+        var s = startOf(u, p);
+
+        if (s >= flat.length) break;
+
+        // Серии до начала тайтла (спешлы, пересказы) — предыдущему тайтлу
+        if (s > p) {
+          if (!spans.length) {
+            if (s - p > 2) return -1;
+            s = p;
+          } else {
+            spans[spans.length - 1].to = s - 1;
+          }
+        }
+
+        var n = u.episodes || u.aired_episodes;
+        var next = list[k + 1];
+        var end = next ? startOf(next, s + 1) - 1 : n ? s + n - 1 : flat.length - 1;
+
+        end = Math.min(end, flat.length - 1);
+
+        // Вышедший тайтл занял заметно больше или меньше серий, чем в нём есть, — раскладка не та
+        if (next && n && u.status === 'released' && Math.abs(end - s + 1 - n) > Math.max(2, Math.round(n * 0.2))) return -1;
+
+        spans.push({ u: u, from: s, to: end });
+        p = end + 1;
+      }
+
+      return p;
+    };
+
+    var p = align(base, 0);
+
+    if (p < 0) return null;
+
+    // После последнего тайтла из карты на TMDB есть ещё серии — новая часть, которой в карте пока нет
+    if (p < flat.length && spans.length) {
+      var last = spans[spans.length - 1].u;
+      var later = extra.filter(function (u) { return u.aired > last.aired; });
+
+      if (later.length) {
+        var q = align(later, p);
+
+        if (q < 0) return null;
+        p = q;
+      }
+    }
+
+    if (p < flat.length && spans.length) spans[spans.length - 1].to = flat.length - 1;
+
+    // Тайтл на несколько сезонов TMDB («Ван-Пис»: один тайтл, 23 сезона TMDB по аркам) — сезоны TMDB
+    var tmdbOf = function (i) { return flat[i].t.season_number; };
+
+    if (spans.some(function (sp) { return tmdbOf(sp.from) !== tmdbOf(sp.to); })) return 'tmdb';
+
+    // Номера сезонов: из карты, если они идут подряд с 1 и не склеивают сезоны TMDB, иначе — по порядку,
+    // а тайтл того же сезона TMDB с названием части («… - Ketsubetsu-tan», «… Part 2») — часть сезона
+    var from_map = spans[0].u.season === 1 && spans.every(function (sp, i) {
+      var prev = spans[i - 1];
+
+      if (sp.u.season < 1) return false;
+      if (!prev) return true;
+      if (sp.u.season === prev.u.season) return tmdbOf(sp.from) === tmdbOf(prev.from);
+
+      return sp.u.season === prev.u.season + 1;
+    });
+    var num = 0;
+    var head = null;
+
+    spans.forEach(function (sp, i) {
+      var prev = spans[i - 1];
+      var same = false;
+
+      if (from_map) same = !!prev && sp.u.season === prev.u.season;
+      else if (prev && tmdbOf(sp.from) === tmdbOf(prev.from)) same = isPartName(sp.u.name, head.name) || isPartName(sp.u.russian, head.russian) || isPartName(sp.u.english, head.english);
+
+      if (!same) {
+        num++;
+        head = sp.u;
+      }
+
+      sp.season = num;
+      sp.head = head;
+    });
+
+    var out = [];
+    var changed = false;
+
+    spans.forEach(function (sp) {
+      var cur = out[out.length - 1];
+
+      if (!cur || cur.season_number !== sp.season) {
+        var t = flat[sp.from].t;
+
+        cur = { season_number: sp.season, episode_count: 0, air_date: flat[sp.from].ep.air_date || t.air_date, poster_path: t.poster_path, tmdb_season: t.season_number, episodes: [], parts: [] };
+        out.push(cur);
+      }
+
+      var first = cur.episodes.length + 1;
+
+      for (var i = sp.from; i <= sp.to; i++) {
+        var c = {};
+        var ep = flat[i].ep;
+
+        for (var key in ep) c[key] = ep[key];
+
+        c.tmdb_episode = ep.episode_number;
+        c.abs = i + 1;
+        c.episode_number = cur.episodes.length + 1;
+        c.season_number = sp.season;
+        c.part = cur.parts.length + 1;
+        cur.episodes.push(c);
+      }
+
+      cur.parts.push({ n: cur.parts.length + 1, from: first, to: cur.episodes.length, id: sp.u.id, name: partTitle(sp.u, sp.head) });
+      cur.episode_count = cur.episodes.length;
+    });
+
+    out.forEach(function (s) {
+      var t = tmdb.filter(function (x) { return x.season_number === s.tmdb_season; })[0];
+
+      // Сезон совпал с сезоном TMDB — номера серий как на TMDB
+      if (s.season_number === s.tmdb_season && t && s.episode_count === tmdbEpisodes(data[t.season_number] || data[t.season_number + '']).filter(function (e) { return e.episode_number > 0; }).length) {
+        s.episodes.forEach(function (c) { c.episode_number = c.tmdb_episode; });
+        s.parts.forEach(function (pt) {
+          pt.from = s.episodes[pt.from - 1].episode_number;
+          pt.to = s.episodes[pt.to - 1].episode_number;
+        });
+      } else {
+        changed = true;
+      }
+
+      // Тайтлы Shikimori сезона по порядку — anime.js раскладывает по ним досмотренные серии
+      s.shiki = s.parts.map(function (pt) { return { id: pt.id, episodes: pt.to - pt.from + 1 }; });
+
+      if (s.parts.length > 1) changed = true;
+      else s.parts = [];
+    });
+
+    return changed || out.length !== tmdb.length ? out : 'tmdb';
+  }
+
+  // Тайтлы Shikimori один к одному совпадают с сезонами TMDB («Клинок»: пять тайтлов — пять сезонов
+  // с тем же числом серий) — раскладывать нечего, серии всех сезонов можно не грузить
+  function unitsMatchTmdb(units, tmdb) {
+    var now = Date.now();
+    var list = units.filter(function (u) { var a = dayTime(u.aired); return !u.extra && a && a <= now + DAY; });
+
+    if (list.length !== tmdb.length) return false;
+
+    return list.every(function (u, i) {
+      var n = u.episodes || u.aired_episodes;
+
+      return (!u.season || u.season === i + 1) && n && Math.abs(n - tmdb[i].episode_count) <= 1;
+    });
+  }
+
+  // Сезоны TMDB как список с серийными номерами: { season_number, episodes: [{ episode_number, abs }] }
+  function tmdbList(movie, data) {
+    var abs = 0;
+
+    return tmdbSeasons(movie).map(function (t) {
+      var list = tmdbEpisodes(data[t.season_number] || data[t.season_number + '']).filter(function (e) { return e.episode_number > 0; });
+
+      list.sort(function (a, b) { return a.episode_number - b.episode_number; });
+
+      return { season_number: t.season_number, episodes: list.map(function (ep) { return { episode_number: ep.episode_number, abs: ++abs }; }) };
+    });
+  }
+
+  // Сезоны собраны иначе, чем раньше (было по названиям раздач, стало по Shikimori): отметки просмотра лежат
+  // по старым номерам серий («Реинкарнация»: старый «2 сезон» — это вторая часть 1 сезона). Один раз
+  // перекладываем их по сквозному номеру серии. → [[view, percent, time, duration], …] — что записать
+  function moveMarks(movie, from, to) {
+    var target = {};
+    var marks = [];
+    var out = [];
+
+    to.forEach(function (s) {
+      s.episodes.forEach(function (ep) { target[ep.abs] = [s.season_number, ep.episode_number]; });
+    });
+
+    from.forEach(function (s) {
+      s.episodes.forEach(function (ep) {
+        var v = episodeView(movie, s.season_number, ep.episode_number);
+
+        if (v.percent > 0 || v.time > 0) marks.push({ to: target[ep.abs], old: [s.season_number, ep.episode_number], percent: v.percent, time: v.time, duration: v.duration });
+      });
+    });
+
+    var placed = {};
+
+    marks.forEach(function (m) { if (m.to) placed[m.to.join(':')] = m; });
+
+    // Старые места, на которые ничего не переезжает, — освобождаем
+    marks.forEach(function (m) {
+      if (placed[m.old.join(':')]) return;
+
+      var v = episodeView(movie, m.old[0], m.old[1]);
+
+      out.push([v, 0, 0, v.duration || 0]);
+    });
+
+    Object.keys(placed).forEach(function (k) {
+      var m = placed[k];
+      var p = k.split(':');
+      var v = episodeView(movie, +p[0], +p[1]);
+
+      if (v.percent !== m.percent || v.time !== m.time) out.push([v, m.percent, m.time, m.duration || v.duration || 0]);
+    });
+
+    return out;
+  }
+
+  // Сезоны сериала: по Shikimori (units) или, без них, по названиям раздач. data — серии всех сезонов TMDB.
+  // → { list — сезоны для season_splits или null (как на TMDB), how — как получились (для консоли) }
+  function buildSeasons(movie, items, data, units) {
+    if (units && units.length && tmdbSeasons(movie).length <= 8) {
+      var list = unitSeasons(movie, data, units);
+
+      if (list === 'tmdb') return { list: null, how: 'Shikimori: как на TMDB' };
+      if (list) return { list: list, how: 'Shikimori' };
+    }
+
+    var plan = planSplit(movie, items);
+
+    return { list: plan ? splitSeasons(movie, data, plan) : null, plan: plan, how: plan ? 'по раздачам' : 'без изменений' };
+  }
+
   // Серия по номеру в сезоне TMDB («Jujutsu Kaisen - 25» → 2 сезон, 1 серия). Без сезона — по сквозному номеру
   function splitAbsolute(split, tmdb_season, e) {
     for (var i = 0; i < split.list.length; i++) {
@@ -2015,6 +2489,59 @@
     return null;
   }
 
+  // Сквозной номер серии → сезон и серия экрана («One Piece - 0500.mkv» → 13 сезон, 9 серия)
+  function absTarget(movie, abs) {
+    var list = realSeasons(movie);
+    var e = abs;
+
+    for (var i = 0; i < list.length; i++) {
+      if (e <= list[i].episode_count) return { season: list[i].season_number, episode: e };
+
+      e -= list[i].episode_count;
+    }
+
+    return null;
+  }
+
+  // Раздача одной части («2 сезон: Часть 2: 1-13», «[ТВ-2, часть 2]») обычно считает серии с начала
+  // части: 01–13 — это 14–26-я серии сезона. Решаем по номерам всех видеофайлов раздачи: все не больше
+  // длины части — сдвиг на начало части; номера уже от начала сезона (14–26) — сдвига нет
+  function partOffset(movie, r, nums) {
+    if (!r.parts || r.seasons.length > 1 || !nums.length) return null;
+
+    var with_parts = realSeasons(movie).filter(function (s) { return (s.parts || []).length >= r.parts[0]; });
+    var s = r.seasons.length ? seasonOf(movie, r.seasons[0]) : with_parts.length === 1 ? with_parts[0] : null;
+
+    if (!s || !s.parts || s.parts.length < 2) return null;
+
+    var a = s.parts[r.parts[0] - 1];
+    var b = s.parts[Math.min(r.parts[1], s.parts.length) - 1];
+    var min = Math.min.apply(null, nums);
+    var max = Math.max.apply(null, nums);
+
+    if (!a || !b || a.from <= 1 || min >= a.from || max > b.to - a.from + 1) return null;
+
+    return { season: s.season_number, offset: a.from - 1 };
+  }
+
+  // Какой серии экрана соответствует файл раздачи. ls/le — что разобрала Lampa по имени файла,
+  // ctx — сдвиг для раздачи части (partOffset)
+  function fileTarget(movie, r, path, ls, le, ctx) {
+    if (!le) return null;
+    if (ctx && ctx.offset) return { season: ctx.season, episode: le + ctx.offset };
+
+    var split = season_splits[movie.id];
+    var to = split ? splitFile(split, r, path, ls, le) : releaseSeasonFile(movie, r, path, ls, le);
+    var s = to ? to.season : pathSeason(path) || (r.seasons.length === 1 ? r.seasons[0] : 0) || ls || 1;
+    var e = to ? to.episode : le;
+    var season = seasonOf(movie, s);
+
+    // Номер больше, чем серий в сезоне, — сквозная нумерация («One Piece - 0500», «Gintama TV-2 [202-252]»)
+    if (season && e > season.episode_count) return absTarget(movie, e) || to;
+
+    return to;
+  }
+
   // Серии сезонов, которые уже загружал экран сериала: по ним названия и кадры в списке файлов
   var episode_cache = {};
 
@@ -2073,22 +2600,34 @@
       return start.apply(this, arguments);
     };
 
-    // Lampa считает сезон по имени файла, а без него — первым. Для разрезанного сезона и для раздачи
-    // одного сезона без сезона в именах файлов переставляем сезон, серию и прогресс у файла и его копии
-    // в плейлисте, а в уже нарисованной плитке — название, кадр, сезон и дату
+    var VIDEO = /\.(mkv|mp4|avi|m4v|mov|ts|m2ts|webm|wmv|mpg|mpeg|flv)$/i;
+
+    // Lampa считает сезон по имени файла, а без него — первым. Для разрезанного сезона, раздачи одного
+    // сезона без сезона в именах файлов, раздачи части и сквозной нумерации переставляем сезон, серию и
+    // прогресс у файла и его копии в плейлисте, а в уже нарисованной плитке — название, кадр, сезон и дату
     Lampa.Listener.follow('torrent_file', function (e) {
+      var movie = e.params && e.params.movie;
+
+      if (e.type === 'list_open') {
+        var nums = (e.items || []).filter(function (f) { return VIDEO.test(f.path || ''); }).map(function (f) { return fileEpisodeNo(f.path); }).filter(Boolean);
+
+        if (torrent_ctx && movie && torrent_ctx.movie_id === movie.id) torrent_ctx.part = partOffset(movie, torrent_ctx.r, nums);
+
+        return;
+      }
+
       if (e.type !== 'render') return;
 
-      var movie = e.params && e.params.movie;
       var el = e.element;
 
       if (!movie || !movie.id || !el) return;
 
       var split = season_splits[movie.id];
-      var r = torrent_ctx && torrent_ctx.movie_id === movie.id ? torrent_ctx.r : { seasons: [] };
+      var ctx = torrent_ctx && torrent_ctx.movie_id === movie.id ? torrent_ctx : null;
+      var r = ctx ? ctx.r : { seasons: [] };
       var ls = parseInt(el.season, 10) || 0;
       var le = parseInt(el.episode, 10) || 0;
-      var to = split ? splitFile(split, r, el.path, ls, le) : releaseSeasonFile(movie, r, el.path, ls, le);
+      var to = fileTarget(movie, r, el.path, ls, le, ctx && ctx.part);
 
       if (!to) return;
 
@@ -2096,7 +2635,7 @@
       var view = moved ? episodeView(movie, to.season, to.episode) : null;
       var copy = (el.playlist || []).filter(function (p) { return p !== el && p.url === el.url; })[0];
       var part = split && split.list.filter(function (p) { return p.season_number === to.season; })[0];
-      var ep = split ? part && part.episodes[to.episode - 1] : cachedEpisode(movie, to.season, to.episode);
+      var ep = split ? part && part.episodes.filter(function (x) { return x.episode_number === to.episode; })[0] : cachedEpisode(movie, to.season, to.episode);
       var name = ep && ep.name || (moved ? 'Серия ' + to.episode : '');
       var still = ep && ep.still_path ? Lampa.Api.img(ep.still_path) : moved && movie.backdrop_path ? Lampa.Api.img(movie.backdrop_path) : '';
 
@@ -3061,62 +3600,8 @@
 
     // --- раздачи для текущего сезона, озвучки, качества ---
 
-    function coversSeason(it, n) {
-      return it.r.seasons.indexOf(n) >= 0;
-    }
-
-    function coversEpisode(it, e) {
-      var r = it.r;
-
-      if (r.ep_range && r.seasons.length <= 1) return e >= r.ep_range[0] && e <= r.ep_range[1];
-
-      return true;
-    }
-
     function releasesFor(n) {
-      var all = items;
-
-      // Фильм: раздачи другого года («Коллекция 2002-2016» для фильма 2026) и сезоны
-      // одноимённого сериала не предлагаем
-      if (!serial) {
-        var same = items.filter(function (it) { return yearMatches(it.r, movie_year) && !it.r.seasons.length; });
-
-        if (same.length) all = same;
-      }
-
-      var list = all.filter(function (it) { return !it.r.cam; });
-
-      if (!list.length) list = all.slice();
-      if (!serial) return list;
-
-      // Сериал: раздачи с годами вне лет выхода — другое произведение с тем же названием
-      // (фильм «Тетрадь смерти» 2017 года у сериала 2006–2007)
-      // Конец — по последнему сезону и следующей серии: TMDB обновляет last_air_date с опозданием
-      // («Киберпанк: Бегущие по краю», 2 сезон вышел в 2026, а last_air_date ещё 2022); идущий сериал — до этого года
-      var yearOf = function (d) { return parseInt((d || '').slice(0, 4), 10) || 0; };
-      var y0 = yearOf(movie.first_air_date);
-      var y1 = Math.max(yearOf(movie.last_air_date), yearOf(movie.next_episode_to_air && movie.next_episode_to_air.air_date));
-
-      (movie.seasons || []).forEach(function (s) { y1 = Math.max(y1, yearOf(s.air_date)); });
-
-      if (!y1 || movie.in_production || /returning|production|planned/i.test(movie.status || '')) y1 = Math.max(y1, new Date().getFullYear());
-
-      if (y0) {
-        var in_years = list.filter(function (it) {
-          return !it.r.years.length || it.r.years.some(function (y) { return y[1] >= y0 - 1 && y[0] <= y1 + 1; });
-        });
-
-        if (in_years.length) list = in_years;
-      }
-
-      var exact = list.filter(function (it) { return coversSeason(it, n); });
-      var unnamed = list.filter(function (it) { return !it.r.seasons.length; });
-
-      // Сезон в названии не указан: у односезонного сериала это тот же сезон — берём вместе с «[S01]»
-      // («Тетрадь смерти»: одна раздача с S01 и полсотни «1-37 из 37»), у многосезонного — запасной вариант
-      if (realSeasons(movie).length <= 1) return exact.concat(unnamed);
-
-      return exact.length ? exact : unnamed;
+      return serial ? seasonReleases(movie, items, n) : movieReleases(items, movie_year);
     }
 
     function matchVoice(key) {
@@ -3166,44 +3651,32 @@
       return it.el.hash || it.el.Title;
     }
 
+    // Озвучка и качество отсекают друг друга: выбрана озвучка — в качестве остаются только те, что у неё
+    // есть, выбрано качество — в озвучках только те, что есть в этом качестве. «Любая» и «Любое» снимают
+    // выбор; без выбранного качества лучшей считается раздача в качестве из настроек (scoreRelease)
     function computePick() {
       var list = serial ? releasesFor(cur.season) : releasesFor(0);
-
-      pick.voices = voiceOptions(list);
-
       var want_voice = prefs.voice || 'any';
+      var want_q = prefs.quality && prefs.quality !== 'auto' ? prefs.quality : '';
 
-      pick.voice = pick.voices.some(function (v) { return v.key === want_voice; }) ? want_voice : 'any';
+      pick.all = list;
+
+      // Сначала озвучка — она важнее: есть в сезоне — берём, нет — «Любая»
+      pick.voice = voiceOptions(list).some(function (v) { return v.key === want_voice; }) ? want_voice : 'any';
 
       var by_voice = list.filter(matchVoice(pick.voice));
       var qc = {};
 
       by_voice.forEach(function (it) { qc[it.r.res] = (qc[it.r.res] || 0) + 1; });
 
-      pick.qualities = RES_ORDER.filter(function (q) { return qc[q]; }).map(function (q) { return { key: q, count: qc[q] }; });
+      // Качество: выбранное есть у этой озвучки — берём, нет — «Любое»
+      pick.quality = want_q && qc[want_q] ? want_q : '';
+      pick.qualities = [{ key: '', label: 'Любое', count: by_voice.length }].concat(RES_ORDER.filter(function (q) { return qc[q]; }).map(function (q) {
+        return { key: q, label: q, count: qc[q] };
+      }));
 
-      var want_q = prefs.quality || field('tvt_quality', '1080p');
-
-      if (want_q === 'auto') want_q = '4K';
-
-      if (qc[want_q]) pick.quality = want_q;
-      else {
-        var best = '';
-        var dist = 99;
-
-        pick.qualities.forEach(function (q) {
-          var d = Math.abs(RES_RANK[q.key] - (RES_RANK[want_q] || 3));
-
-          if (d < dist) {
-            dist = d;
-            best = q.key;
-          }
-        });
-
-        pick.quality = best;
-      }
-
-      pick.list = by_voice.filter(function (it) { return it.r.res === pick.quality; });
+      pick.voices = voiceOptions(pick.quality ? list.filter(function (it) { return it.r.res === pick.quality; }) : list);
+      pick.list = by_voice.filter(function (it) { return !pick.quality || it.r.res === pick.quality; });
       pick.list.forEach(function (it) {
         it.score = scoreRelease(it, serial);
 
@@ -3214,6 +3687,8 @@
 
       var saved = prefs.release ? pick.list.filter(function (it) { return releaseKey(it) === prefs.release; })[0] : null;
 
+      // chosen — раздача, выбранная вручную («Другая раздача»); без неё серия идёт из лучшей раздачи, где она есть
+      pick.chosen = saved || null;
       pick.release = saved || pick.list[0] || null;
     }
 
@@ -3257,7 +3732,7 @@
 
         el.attr('data-season', n);
         el.find('.tvt-season__name').text(n + ' сезон');
-        el.find('.tvt-season__meta').text(plural(s.episode_count, 'серия', 'серии', 'серий') + (s.air_date ? ' · ' + s.air_date.slice(0, 4) : ''));
+        el.find('.tvt-season__meta').text(plural(s.episode_count, 'серия', 'серии', 'серий') + (s.air_date ? ' · ' + s.air_date.slice(0, 4) : '') + (s.parts && s.parts.length > 1 ? ' · ' + plural(s.parts.length, 'часть', 'части', 'частей') : ''));
         el.toggleClass('active', n === cur.season);
 
         fillSeason(el, s);
@@ -3363,10 +3838,42 @@
 
     // --- серии ---
 
+    // Из какой раздачи смотреть серию e: выбранная вручную, если серия в ней есть; иначе лучшая из раздач той же
+    // озвучки и качества (у выбранной вручную — сначала её продолжение той же студии), потом той же озвучки,
+    // потом любая («Блич»: 1–167 из одной раздачи, 168–366 — из её продолжения). null — серии нет ни в одной
+    function releaseFor(e) {
+      var n = cur.season;
+      var has = function (it) { return coversEpisode(it, e, movie, n); };
+      var chosen = pick.chosen;
+      var by_score = function (list) { return list.sort(function (a, b) { return scoreRelease(b, true) - scoreRelease(a, true); }); };
+
+      if (!serial) return pick.release;
+      if (chosen && has(chosen)) return chosen;
+
+      // pick.list уже по убыванию оценки — первая подходящая и есть лучшая (у «Ван-Писа» сотни раздач на сезон)
+      var first = null;
+
+      for (var i = 0; i < pick.list.length; i++) {
+        var it = pick.list[i];
+
+        if (!has(it)) continue;
+        if (!chosen || it.r.studios.some(function (st) { return chosen.r.studios.indexOf(st) >= 0; })) return it;
+        if (!first) first = it;
+      }
+
+      if (first) return first;
+
+      var all = (pick.all || releasesFor(n)).filter(has);
+      var voice = all.filter(matchVoice(pick.voice));
+
+      return by_score(voice.length ? voice : all)[0] || null;
+    }
+
     function fillEpisode(el, e, ep) {
       var v = episodeView(movie, cur.season, e);
       var state = '';
       var cls = '';
+      var from = pick.all && pick.all.length ? releaseFor(e) : null;
 
       if (ep && isFuture(ep.air_date)) {
         state = 'Выйдет ' + shortDate(ep.air_date);
@@ -3377,9 +3884,11 @@
       } else if (v.time > 0) {
         state = '▶ ' + timeText(v.time);
         cls = 'started';
-      } else if (pick.release && !coversEpisode(pick.release, e)) {
+      } else if (pick.all && pick.all.length && !from) {
         state = 'нет в раздаче';
         cls = 'missing';
+      } else if (from && !matchVoice(pick.voice)(from)) {
+        state = 'другая озвучка';
       }
 
       el.find('.tvt-ep__state').text(state);
@@ -3390,12 +3899,23 @@
     function renderEpisodes() {
       var c = cols.episodes;
       var list = episodesOf(cur.season);
+      var parts = (seasonOf(movie, cur.season) || {}).parts || [];
 
       c.scroll.clear();
       c.last = null;
 
       list.forEach(function (ep) {
         var e = ep.episode_number;
+        var part = parts.length > 1 ? parts.filter(function (p) { return p.from === e; })[0] : null;
+
+        // Сезон из нескольких частей: перед первой серией части — её название
+        if (part) {
+          var head = $('<div class="tvt-part"><span class="tvt-part__n"></span><span class="tvt-part__name"></span></div>');
+
+          head.find('.tvt-part__n').text('Часть ' + part.n);
+          head.find('.tvt-part__name').text([part.name, plural(part.to - part.from + 1, 'серия', 'серии', 'серий')].filter(Boolean).join(' · '));
+          c.scroll.append(head);
+        }
         var el = $('<div class="tvt-ep selector"><div class="tvt-ep__img"><img /><div class="tvt-ep__num"></div><div class="tvt-ep__go">▶</div><div class="tvt-bar"><div></div></div></div><div class="tvt-ep__body"><div class="tvt-ep__name"></div><div class="tvt-ep__meta"></div></div><div class="tvt-ep__state"></div></div>');
 
         if (ep.still_path) el.find('img').attr('src', Lampa.Api.img(ep.still_path, 'w300'));
@@ -3586,6 +4106,31 @@
       }
 
       det.all.text('Все раздачи' + (items.length ? ' (' + items.length + ')' : ''));
+
+      if (serial && det.rel) renderRelease();
+    }
+
+    // Раздача, из которой пойдёт текущая серия: выбранной серии в ней нет — показываем ту, откуда её возьмём
+    function renderRelease() {
+      var it = serial ? releaseFor(cur.episode) || pick.release : pick.release;
+
+      if (!it) {
+        det.rel.text(items.length ? 'Нет раздач для этого сезона' : 'Раздачи не найдены');
+        det.tracks.text('');
+        return;
+      }
+
+      var r = it.r;
+      var el = it.el;
+      var line1 = [r.res + (r.hdr ? ' ' + r.hdr : ''), r.source, r.codec, r.channels, r.seasons.length > 1 ? 'Сезоны ' + r.seasons[0] + '–' + r.seasons[r.seasons.length - 1] : '', r.episodes].filter(Boolean).join(' · ');
+      var line2 = [sizeText(el.Size), '▲ ' + (parseInt(el.Seeders, 10) || 0), trackerText(el.Tracker), sourceText(el), dateText(el.PublishDate)].filter(Boolean).join(' · ');
+
+      det.rel.empty();
+
+      if (pick.chosen && it !== pick.chosen) det.rel.append($('<div class="tvt-det__note"></div>').text('Серия ' + cur.episode + ' — из другой раздачи'));
+
+      det.rel.append($('<div class="tvt-det__rel1"></div>').text(line1)).append($('<div class="tvt-det__rel2"></div>').text(line2));
+      det.tracks.text(r.tracks.length ? 'Дорожки: ' + r.tracks.slice(0, 6).join(', ') + (r.tracks.length > 6 ? ' +' + (r.tracks.length - 6) : '') : (r.types.map(function (t) { return TYPE_LABELS[t]; }).concat(r.studios.slice(0, 4))).join(', '));
     }
 
     function renderOptions() {
@@ -3620,23 +4165,10 @@
       }
 
       pick.qualities.forEach(function (q) {
-        det.quality.append(optChip(q.key, q.count, q.key === pick.quality, function () { _this.setQuality(q.key); }, 'q:' + q.key));
+        det.quality.append(optChip(q.label, q.count, q.key === pick.quality, function () { _this.setQuality(q.key); }, 'q:' + (q.key || 'any')));
       });
 
-      var it = pick.release;
-
-      if (!it) {
-        det.rel.text(items.length ? 'Нет раздач для этого сезона' : 'Раздачи не найдены');
-        det.tracks.text('');
-      } else {
-        var r = it.r;
-        var el = it.el;
-        var line1 = [r.res + (r.hdr ? ' ' + r.hdr : ''), r.source, r.codec, r.channels, r.seasons.length > 1 ? 'Сезоны ' + r.seasons[0] + '–' + r.seasons[r.seasons.length - 1] : '', r.episodes].filter(Boolean).join(' · ');
-        var line2 = [sizeText(el.Size), '▲ ' + (parseInt(el.Seeders, 10) || 0), trackerText(el.Tracker), sourceText(el), dateText(el.PublishDate)].filter(Boolean).join(' · ');
-
-        det.rel.empty().append($('<div class="tvt-det__rel1"></div>').text(line1)).append($('<div class="tvt-det__rel2"></div>').text(line2));
-        det.tracks.text(r.tracks.length ? 'Дорожки: ' + r.tracks.slice(0, 6).join(', ') + (r.tracks.length > 6 ? ' +' + (r.tracks.length - 6) : '') : (r.types.map(function (t) { return TYPE_LABELS[t]; }).concat(r.studios.slice(0, 4))).join(', '));
-      }
+      renderRelease();
 
       if (pick.list.length > 1) {
         det.relbtn.append(optChip('Другая раздача (' + pick.list.length + ') ▾', '', false, function () { _this.chooseRelease(); }, 'r:choose'));
@@ -3714,19 +4246,7 @@
     this.play = function (from_start) {
       // Цель фиксируем сразу: дальше фокус может переехать и сменить текущую серию
       var target = serial ? { season: cur.season, episode: cur.episode } : { movie: true };
-      var it = pick.release;
-
-      if (serial && it && !coversEpisode(it, cur.episode)) {
-        var alt = releasesFor(cur.season).filter(function (x) { return coversEpisode(x, cur.episode); });
-        var same_voice = alt.filter(matchVoice(pick.voice));
-
-        alt = (same_voice.length ? same_voice : alt).sort(function (a, b) { return scoreRelease(b, true) - scoreRelease(a, true); });
-
-        if (alt.length) {
-          it = alt[0];
-          Lampa.Noty.show('Этой серии нет в выбранной раздаче — открываю другую');
-        }
-      }
+      var it = serial ? releaseFor(cur.episode) || pick.release : pick.release;
 
       if (!it) return Lampa.Noty.show('Нет раздачи для просмотра');
 
@@ -3756,7 +4276,7 @@
         _this.refresh();
       }, serial ? function () {
         var alt = releasesFor(target.season).filter(function (x) {
-          return tried.indexOf(releaseKey(x)) < 0 && coversEpisode(x, target.episode);
+          return tried.indexOf(releaseKey(x)) < 0 && coversEpisode(x, target.episode, movie, target.season);
         });
         var same_voice = alt.filter(matchVoice(pick.voice));
 
@@ -3791,7 +4311,7 @@
 
         for (var e = 1; e <= s.episode_count; e++) if (isWatched(episodeView(movie, s.season_number, e))) upto = e;
 
-        return { season: s.season_number, episodes: s.episode_count, watched: upto, air_date: s.air_date || '' };
+        return { season: s.season_number, episodes: s.episode_count, watched: upto, air_date: s.air_date || '', parts: s.shiki || null };
       });
 
       Lampa.Listener.send('tvt_progress', { movie: movie, seasons: list });
@@ -3837,6 +4357,8 @@
         cols.info.scroll.append(info);
       }
 
+      loadUnits();
+
       searchReleases(object, function (data) {
         items = (data && data.Results ? data.Results : []).map(function (el) {
           return { el: el, r: parseRelease(el, movie) };
@@ -3878,7 +4400,7 @@
 
         for (var e = 1; e <= s.episode_count; e++) if (isWatched(episodeView(movie, s.season_number, e))) upto = e;
 
-        return { season: s.season_number, episodes: s.episode_count, watched: upto, air_date: s.air_date || '' };
+        return { season: s.season_number, episodes: s.episode_count, watched: upto, air_date: s.air_date || '', parts: s.shiki || null };
       });
 
       // Каждая отметка в Lampa — запись всей истории просмотров и обновление всех карточек на
@@ -3944,9 +4466,40 @@
       }
     }
 
-    // Сезоны TMDB не совпадают с сезонами раздач — грузим серии TMDB и раскладываем их по сезонам раздач
+    // Части сериала на Shikimori (anime.js) — запрашиваем сразу, параллельно с поиском раздач.
+    // Нет anime.js, не аниме или нет ответа за 8 секунд — сезоны по названиям раздач, как раньше
+    var units_wait = [];
+    var units_state = { done: false, list: null };
+
+    function loadUnits() {
+      var finish = function (list) {
+        if (units_state.done) return;
+
+        units_state.done = true;
+        units_state.list = list && list.length ? list : null;
+        units_wait.splice(0).forEach(function (cb) { cb(units_state.list); });
+      };
+
+      if (!serial || typeof window.tvt_units !== 'function') return finish(null);
+
+      setTimeout(function () { finish(null); }, 8000);
+
+      try {
+        window.tvt_units(movie, finish);
+      } catch (e) {
+        console.log('TV Torrents', 'units', e);
+        finish(null);
+      }
+    }
+
+    function withUnits(cb) {
+      if (units_state.done) cb(units_state.list);
+      else units_wait.push(cb);
+    }
+
+    // Сезоны TMDB не совпадают с сезонами раздач (или у сезона есть части) — грузим серии всех сезонов TMDB
+    // и раскладываем их: по тайтлам Shikimori, а без них — по названиям раздач (buildSeasons)
     function prepareSeasons(done) {
-      var want = planSplit(movie, items);
       var finished = false;
       var finish = function () {
         if (finished) return;
@@ -3955,53 +4508,107 @@
         done();
       };
 
-      // Разбор сезонов — в консоль Lampa (меню → Консоль), чтобы было видно, почему сезон не разрезан
-      var rel = releaseSeasons(items);
-      var log = function (msg) {
-        console.log('TV Torrents', 'сезоны', movie.name || movie.title, '| раздачи: ' + Object.keys(rel).map(function (s) { return s + 'с=' + (rel[s].count || '?') + '/' + rel[s].seen; }).join(' ') + ' | TMDB: ' + tmdbSeasons(movie).map(function (s) { return s.season_number + 'с=' + s.episode_count; }).join(' ') + ' | ' + msg);
-      };
+      withUnits(function (units) {
+        var tmdb = tmdbSeasons(movie);
+        var plan = units ? null : planSplit(movie, items);
 
-      if (!want) {
-        if (isAnimation(movie)) log('без изменений');
-        return finish();
-      }
+        // Разбор сезонов — в консоль Lampa (меню → Консоль), чтобы было видно, почему сезон разрезан или нет
+        var rel = releaseSeasons(items);
+        var log = function (msg) {
+          console.log('TV Torrents', 'сезоны', movie.name || movie.title, '| раздачи: ' + Object.keys(rel).map(function (s) { return s + 'с=' + (rel[s].count || '?') + '/' + rel[s].seen; }).join(' ') + ' | TMDB: ' + tmdb.map(function (s) { return s.season_number + 'с=' + s.episode_count; }).join(' ') +
+            (units ? ' | Shikimori: ' + units.map(function (u) { return u.id + (u.season ? '(' + u.season + ')' : '') + '=' + (u.episodes || u.aired_episodes); }).join(' ') : '') + ' | ' + msg);
+        };
 
-      var nums = tmdbSeasons(movie).map(function (s) { return s.season_number; });
-      var timer = setTimeout(function () {
-        log('серии TMDB не загрузились за 15 с');
-        finish();
-      }, 15000);
+        // Серии всех сезонов нужны, только если есть что раскладывать: несколько тайтлов Shikimori
+        // (или тайтл не совпадает с сезоном TMDB) либо план по раздачам
+        var need = units ? tmdb.length <= 8 && !unitsMatchTmdb(units, tmdb) : !!plan;
 
-      Lampa.Api.seasons(movie, nums, function (data) {
-        clearTimeout(timer);
-
-        if (finished) return;
-
-        try {
-          var list = splitSeasons(movie, data || {}, want);
-
-          log('план ' + want.plan.map(function (p) { return p.tmdb.season_number + '→' + p.seasons.join(',') + '(' + p.counts.join(',') + ')'; }).join(' ') + (want.tail ? ' +хвост' : '') +
-            ' | серий TMDB: ' + nums.map(function (n) { var j = data && (data[n] || data[n + '']); return n + 'с=' + (j ? tmdbEpisodes(j).length : 'нет'); }).join(' ') +
-            ' | итог: ' + (list ? list.map(function (p) { return p.season_number + 'с=' + p.episode_count; }).join(' ') : 'не разрезан'));
-
-          if (list) {
-            season_splits[movie.id] = { list: list };
-            list.forEach(function (p) { seasons_data[p.season_number] = { episodes: p.episodes }; });
-          } else {
-            nums.forEach(function (n) {
-              var json = data && (data[n] || data[n + '']);
-
-              if (json) seasons_data[n] = { episodes: tmdbEpisodes(json) };
-            });
-          }
-
-          renderHead();
-        } catch (e) {
-          log('ошибка: ' + (e && e.message || e));
+        if (!need) {
+          if (isAnimation(movie)) log(units ? 'как на TMDB' : 'без изменений');
+          return finish();
         }
 
-        finish();
+        var nums = tmdb.map(function (s) { return s.season_number; });
+        var timer = setTimeout(function () {
+          log('серии TMDB не загрузились за 15 с');
+          finish();
+        }, 15000);
+
+        Lampa.Api.seasons(movie, nums, function (data) {
+          clearTimeout(timer);
+
+          if (finished) return;
+
+          try {
+            var built = buildSeasons(movie, items, data || {}, units);
+            var list = built.list;
+
+            log(built.how + (built.plan ? ' | план ' + built.plan.plan.map(function (p) { return p.tmdb.season_number + '→' + p.seasons.join(',') + '(' + p.counts.join(',') + ')'; }).join(' ') + (built.plan.tail ? ' +хвост' : '') : '') +
+              ' | серий TMDB: ' + nums.map(function (n) { var j = data && (data[n] || data[n + '']); return n + 'с=' + (j ? tmdbEpisodes(j).length : 'нет'); }).join(' ') +
+              ' | итог: ' + (list ? list.map(function (p) { return p.season_number + 'с=' + p.episode_count + (p.parts && p.parts.length > 1 ? '[' + p.parts.map(function (x) { return x.to - x.from + 1; }).join('+') + ']' : ''); }).join(' ') : 'как на TMDB'));
+
+            if (list) {
+              season_splits[movie.id] = { list: list };
+              list.forEach(function (p) { seasons_data[p.season_number] = { episodes: p.episodes }; });
+            } else {
+              nums.forEach(function (n) {
+                var json = data && (data[n] || data[n + '']);
+
+                if (json) seasons_data[n] = { episodes: tmdbEpisodes(json) };
+              });
+            }
+
+            if (units && /^Shikimori/.test(built.how) && titlePrefs(movie).model !== 2) moveOldMarks(data || {}, list || tmdbList(movie, data || {}));
+
+            renderHead();
+          } catch (e) {
+            log('ошибка: ' + (e && e.message || e));
+          }
+
+          finish();
+        });
       });
+    }
+
+    // Раньше (до 1.14) сезоны этого аниме собирались по названиям раздач — если вышло иначе, переносим
+    // отметки и последнюю серию в новую нумерацию. Один раз на тайтл; записи — по 10 за кадр, как в pullWatched
+    function moveOldMarks(data, now) {
+      var plan = planSplit(movie, items);
+      var before = (plan && splitSeasons(movie, data, plan)) || tmdbList(movie, data);
+      var shape = function (list) { return list.map(function (s) { return s.season_number + ':' + s.episodes.length; }).join(' '); };
+      var patch = { model: 2 };
+
+      if (shape(before) !== shape(now)) {
+        var queue = moveMarks(movie, before, now);
+        var last = titlePrefs(movie).last;
+
+        if (last) {
+          var abs = 0;
+
+          before.forEach(function (s) {
+            s.episodes.forEach(function (ep) { if (s.season_number === last.season && ep.episode_number === last.episode) abs = ep.abs; });
+          });
+
+          now.forEach(function (s) {
+            s.episodes.forEach(function (ep) { if (abs && ep.abs === abs) patch.last = { season: s.season_number, episode: ep.episode_number, t: last.t }; });
+          });
+        }
+
+        console.log('TV Torrents', 'сезоны', movie.name || movie.title, '| нумерация сменилась, переношу отметок: ' + queue.length);
+
+        var step = function () {
+          queue.splice(0, 10).forEach(function (w) { w[0].handler(w[1], w[2], w[3]); });
+
+          if (queue.length) return setTimeout(step, 16);
+          if (ready) _this.refresh();
+        };
+
+        step();
+      }
+
+      saveTitlePrefs(movie, patch);
+
+      if (patch.last) prefs.last = patch.last;
     }
 
     // Последняя серия могла быть запомнена в нумерации TMDB (1 сезон, 30 серия) — переводим в нумерацию раздач
@@ -5004,6 +5611,10 @@
     '.tvt-ep.watched .tvt-ep__state{color:#5fe08a;font-size:1.3em}',
     '.tvt-ep.started .tvt-ep__state{color:#ffd54a}',
     '.tvt-ep.missing,.tvt-ep.future{opacity:0.5}',
+    '.tvt-part{display:flex;align-items:baseline;padding:0.7em 0.5em 0.35em;font-size:1.05em;opacity:0.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.tvt-part__n{font-weight:700;margin-right:0.6em}',
+    '.tvt-part__name{opacity:0.7;overflow:hidden;text-overflow:ellipsis}',
+    '.tvt-det__note{font-size:0.95em;color:#ffd54a;margin-bottom:0.3em}',
     '.tvt-ep.active{background:rgba(255,255,255,0.1)}',
     '.tvt-ep.focus{background:rgba(255,255,255,0.18);border-color:#fff;opacity:1}',
     '.tvt-det{padding-bottom:1em}',
@@ -5335,19 +5946,33 @@
     console.log('TV Torrents', 'started', VERSION);
   }
 
-  // Для проверки разбора сезонов на сохранённых данных: результаты парсера + серии TMDB → сезоны
-  function testSeasons(movie, results, data) {
+  // Для проверки разбора сезонов на сохранённых данных (tests/): результаты парсера + серии TMDB → сезоны,
+  // как их соберёт экран сериала
+  function testSeasons(movie, results, data, units) {
     var items = results.map(function (el) { return { el: el, r: parseRelease(el, movie) }; });
-    var plan = planSplit(movie, items);
-    var list = plan ? splitSeasons(movie, data, plan) : null;
+    var built = buildSeasons(movie, items, data, units);
+    var list = built.list;
 
-    return { plan: plan, seasons: (list || tmdbSeasons(movie)).map(function (s) { return s.season_number + ':' + s.episode_count; }), list: list };
+    if (list) season_splits[movie.id] = { list: list };
+    else delete season_splits[movie.id];
+
+    return {
+      plan: built.plan,
+      how: built.how,
+      items: items,
+      list: realSeasons(movie),
+      seasons: realSeasons(movie).map(function (s) { return s.season_number + ':' + s.episode_count; }),
+      releases: function (n) { return seasonReleases(movie, items, n); }
+    };
   }
 
   window.tvt_api = {
     parseRelease: parseRelease,
     buildSearchParams: buildSearchParams,
     testSeasons: testSeasons,
+    coversEpisode: coversEpisode,
+    seasonYears: seasonYears,
+    files: { target: fileTarget, partOffset: partOffset, pathSeason: pathSeason, episodeNo: fileEpisodeNo, span: releaseSpan },
     sync: function () { runSync(true); },
     // Для anime.js: свои файлы в репозитории синхронизации и открытие сериала на нужном сезоне
     store: { ready: function () { return !!syncConfig(); }, get: storeGet, put: storePut, info: storeInfo },
