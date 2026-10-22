@@ -7,7 +7,7 @@
   if (window.tvt_plugin_ready) return;
   window.tvt_plugin_ready = true;
 
-  var VERSION = '1.15.5';
+  var VERSION = '1.15.6';
 
   // ---------------------------------------------------------------------------
   // Разбор названия раздачи
@@ -668,6 +668,8 @@
     s += Math.min(35, Math.log(1 + seeds) * 7);
 
     if (!seeds) s -= 30;
+    // Недавно не ответила — в самый конец (markSilent)
+    if (isSilent(el)) s -= 200;
     if (r.cam) s -= 60;
     if (r.is3d) s -= 15;
     // Сборник фильмов и образ диска — сотни файлов и десятки гигабайт, телевизору тяжело
@@ -1796,6 +1798,10 @@
     }
 
     if (!r.parts || parts.length < 2 || r.seasons.length > 1) return range;
+
+    // Части, которой у сезона нет («Атака титанов (4 сезон. Часть 3: 1 серия из 2)» — финал 2023 года, а 4 сезон
+    // на TMDB — две части, 28 серий): серий этого сезона в раздаче нет, «1 серия» в ней — не 1-я серия сезона
+    if (r.parts[0] > parts.length) return [0, -1];
 
     var a = parts[r.parts[0] - 1];
     var b = parts[Math.min(r.parts[1], parts.length) - 1];
@@ -3466,9 +3472,9 @@
   }
 
   // missing — что делать, если нужной серии в раздаче не оказалось (экран сериала пробует другую раздачу).
-  // limit — сколько ждать список файлов: другую раздачу плагин открывает сам, и если у неё нет сидов, Lampa
-  // крутила бы загрузку полторы минуты; такую закрываем раньше
-  function startAutoplay(el, movie, target, done, missing, limit) {
+  // limit — сколько ждать список файлов: у раздачи без живых сидов Lampa крутила бы загрузку полторы минуты;
+  // такую закрываем раньше и зовём silent (экран сериала открывает другую раздачу)
+  function startAutoplay(el, movie, target, done, missing, limit, silent) {
     finishAutoplay();
 
     var ap = autoplay = { el: el, target: target, movie: movie, files: [], picked: false, started: false, done: done, missing: missing, time: Date.now() };
@@ -3477,12 +3483,19 @@
       ap.wait = setTimeout(function () {
         if (autoplay !== ap || ap.opened) return;
 
+        // В окне Lampa уже не загрузка, а ошибка (TorrServer недоступен, нет ссылки на раздачу) — другая раздача не поможет
+        var waiting = $('.modal .modal-loading').length > 0;
+
         finishAutoplay();
 
-        // Окно загрузки Lampa закрывается своим «Назад» — оно же отменяет торрент в TorrServer
+        if (!waiting) return;
+
+        // Окно загрузки Lampa закрывается своим «Назад» — оно же отменяет торрент в TorrServer и останавливает опрос
+        // Lampa (после своей ошибки через полторы минуты она его не останавливает и каждые 2 с удаляет этот торрент)
         if (Lampa.Controller.enabled().name === 'modal') Lampa.Controller.back();
 
-        Lampa.Noty.show('Раздача не отвечает — выберите другую в «Все раздачи»');
+        if (silent) silent();
+        else Lampa.Noty.show('Раздача не отвечает — выберите другую в «Все раздачи»');
       }, limit);
     }
 
@@ -3510,6 +3523,40 @@
     keys.slice(-299).forEach(function (k) { keep[k] = all[k]; });
     keep[badKey(el, movie, season)] = Date.now();
     Lampa.Storage.set('tvt_bad', keep);
+  }
+
+  // Раздачи, которые не ответили: TorrServer за SILENT_LIMIT не получил от пиров их список файлов. Живые отдают его
+  // за 1–10 с, а сиды у парсера — со страницы трекера, не живые («Атака титанов»: ▲50 и ▲105, на открытых
+  // трекерах — 0 сидов). Несколько часов такие идут последними (scoreRelease)
+  var SILENT_LIMIT = 15000;
+  var SILENT_TTL = 6 * 3600000;
+  var silent_cache = null;
+
+  function silentReleases() {
+    if (!silent_cache) silent_cache = readJson('tvt_silent');
+
+    return silent_cache;
+  }
+
+  function isSilent(el) {
+    var h = btih(el);
+    var t = h && silentReleases()[h];
+
+    return !!t && Date.now() - t < SILENT_TTL;
+  }
+
+  function markSilent(el) {
+    var h = btih(el);
+
+    if (!h) return;
+
+    var all = silentReleases();
+    var keep = {};
+
+    Object.keys(all).filter(function (k) { return Date.now() - all[k] < SILENT_TTL; }).slice(-299).forEach(function (k) { keep[k] = all[k]; });
+    keep[h] = Date.now();
+    silent_cache = keep;
+    Lampa.Storage.set('tvt_silent', keep);
   }
 
   function autoPick() {
@@ -3990,19 +4037,26 @@
 
       pick.voices = voiceOptions(pick.quality ? list.filter(function (it) { return it.r.res === pick.quality; }) : list);
       pick.list = by_voice.filter(function (it) { return !pick.quality || it.r.res === pick.quality; });
-      pick.list.forEach(function (it) {
-        it.score = scoreRelease(it, serial);
-
-        // «Оригинал + субтитры»: раздачи со своими русскими субтитрами — раньше тех, к которым их придётся искать в интернете
-        if (pick.voice === 't:sub' && it.r.rus_subs) it.score += 1000;
-      });
-      pick.list.sort(function (a, b) { return b.score - a.score; });
+      sortPick();
 
       var saved = prefs.release ? pick.list.filter(function (it) { return releaseKey(it) === prefs.release; })[0] : null;
 
       // chosen — раздача, выбранная вручную («Другая раздача»); без неё серия идёт из лучшей раздачи, где она есть
       pick.chosen = saved || null;
       pick.release = saved || pick.list[0] || null;
+    }
+
+    // «Оригинал + субтитры»: раздачи со своими русскими субтитрами — раньше тех, к которым их придётся искать в интернете
+    function pickScore(it) {
+      return scoreRelease(it, serial) + (pick.voice === 't:sub' && it.r.rus_subs ? 1000 : 0);
+    }
+
+    // Порядок раздач заново — и когда одна из них не ответила (markSilent), не трогая выбранную вручную
+    function sortPick() {
+      pick.list.forEach(function (it) { it.score = pickScore(it); });
+      pick.list.sort(function (a, b) { return b.score - a.score; });
+
+      if (pick.release && !pick.chosen) pick.release = pick.list[0] || null;
     }
 
     // --- сезоны ---
@@ -4579,36 +4633,49 @@
       launch(it, target, []);
     };
 
-    // Запуск серии из раздачи. Серии в файлах не оказалось (раздача другого сезона, неполная) —
-    // пробуем следующую подходящую раздачу той же озвучки, потом любой; не больше трёх попыток
+    // Запуск серии из раздачи. Серии в файлах не оказалось (раздача другого сезона, неполная) или раздача
+    // не отвечает (SILENT_LIMIT) — пробуем следующую подходящую раздачу той же озвучки и качества, потом той же
+    // озвучки, потом любой; не больше трёх попыток. Выбранную вручную («Другая раздача») не подменяем,
+    // если она молчит, — её ждём столько, сколько ждёт Lampa
     function launch(it, target, tried) {
       tried.push(releaseKey(it));
 
       // Выбраны «Оригинал + субтитры», а в раздаче русских субтитров нет — их поищет OpenSubtitles
       target.want_subs = pick.voice === 't:sub' && !it.r.rus_subs;
 
-      startAutoplay(it.el, movie, target, function () {
-        _this.refresh();
-      }, serial ? function () {
-        var alt = releasesFor(target.season).filter(function (x) {
-          return tried.indexOf(releaseKey(x)) < 0 && coversEpisode(x, target.episode, movie, target.season);
+      var manual = it === pick.chosen;
+
+      var next = function (silent) {
+        var alt = releasesFor(serial ? target.season : 0).filter(function (x) {
+          return tried.indexOf(releaseKey(x)) < 0 && (!serial || coversEpisode(x, target.episode, movie, target.season));
         });
         var same_voice = alt.filter(matchVoice(pick.voice));
+        var same_quality = same_voice.filter(function (x) { return !pick.quality || x.r.res === pick.quality; });
 
-        alt = same_voice.length ? same_voice : alt;
+        alt = same_quality.length ? same_quality : same_voice.length ? same_voice : alt;
 
         // Раздача без сидов у TorrServer грузится до полутора минут и заканчивается ошибкой — такие только в крайнем случае
         var seeded = alt.filter(function (x) { return (parseInt(x.el.Seeders, 10) || 0) > 0; });
 
-        alt = (seeded.length ? seeded : alt).sort(function (a, b) { return scoreRelease(b, true) - scoreRelease(a, true); });
+        alt = (seeded.length ? seeded : alt).sort(function (a, b) { return pickScore(b) - pickScore(a); });
 
         if (!alt.length || tried.length >= 3) {
+          if (silent) return Lampa.Noty.show((tried.length > 1 ? 'Раздачи не отвечают (' + tried.length + ')' : 'Раздача не отвечает') + ' — выберите другую в «Все раздачи»');
+
           return Lampa.Noty.show('Серии ' + target.episode + ' нет в ' + (tried.length > 1 ? tried.length + ' раздачах' : 'этой раздаче') + ' — выберите раздачу в «Все раздачи»');
         }
 
-        Lampa.Noty.show('Серии ' + target.episode + ' нет в этой раздаче — открываю другую');
+        Lampa.Noty.show(silent ? 'Раздача не отвечает — пробую другую (' + (tried.length + 1) + ' из 3)' : 'Серии ' + target.episode + ' нет в этой раздаче — открываю другую');
         launch(alt[0], target, tried);
-      } : null, tried.length > 1 ? 30000 : 0);
+      };
+
+      startAutoplay(it.el, movie, target, function () {
+        _this.refresh();
+      }, serial ? function () { next(false); } : null, manual ? 0 : SILENT_LIMIT, manual ? null : function () {
+        markSilent(it.el);
+        sortPick();
+        next(true);
+      });
     }
 
     // Прогресс изменился (плеер вернул позицию) — обновляем отметки на месте, не трогая фокус
