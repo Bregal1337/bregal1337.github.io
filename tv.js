@@ -7,7 +7,7 @@
   if (window.tvt_plugin_ready) return;
   window.tvt_plugin_ready = true;
 
-  var VERSION = '1.15.6';
+  var VERSION = '1.15.7';
 
   // ---------------------------------------------------------------------------
   // Разбор названия раздачи
@@ -5120,6 +5120,7 @@
         window.tvt_season_hint = null;
 
         cur.season = start_season;
+        rememberEpisodes(movie, seasons);
         renderSeasons();
 
         selectSeason(start_season, function () {
@@ -5347,6 +5348,198 @@
     return out;
   }
 
+  // Почти весь прогресс в файле — отметки «просмотрено» без позиции (перенос из Shikimori, «Отметить просмотренной»):
+  // по 50 байт на серию, у «Гинтамы» — 450 записей. В файл они идут сводкой по сезонам (seen: «сезон 1: 1–3, 5–201»),
+  // а другое устройство сразу разворачивает её обратно в отметки серий — карточки там с прогрессом и без открытия
+  // сериала. Сводка собирается для сериалов, у которых известны оригинальное название (из него — ключи серий
+  // Lampa) и сезоны: их запоминает экран сериала, приносят файлы других устройств, а для закладок и истории
+  // плагин находит их сам. Отметки вне сводки — одним числом (w: время отметки), остальное — как в Lampa (views)
+  var SYNC_RUN_GAP = 60000;          // отрезок сводки — подряд идущие отметки, поставленные за минуту; время у него одно
+  var SYNC_FORGET = 60 * 86400000;   // «сброшено» и удалённые закладки нужны, пока их не увидели другие устройства
+
+  function epHash(o, s, e) {
+    return Lampa.Utils.hash([s, s > 10 ? ':' : '', e, o].join(''));
+  }
+
+  function isBare(v) {
+    return v.p >= 100 && !v.t && !v.d;
+  }
+
+  // Сериалы для сводки: {ключ карточки: {o: оригинальное название, n: {сезон: серий}}}
+  function addEpTitles(list) {
+    var all = readJson('tvt_sync_eps');
+    var changed = false;
+
+    list.forEach(function (x) {
+      if (!x.o) return;
+
+      var cur = all[x.key] && all[x.key].o === x.o ? all[x.key] : { o: x.o, n: {} };
+
+      if (cur !== all[x.key]) changed = true;
+
+      for (var s in x.n) {
+        if ((cur.n[s] || 0) < x.n[s]) {
+          cur.n[s] = x.n[s];
+          changed = true;
+        }
+      }
+
+      all[x.key] = cur;
+    });
+
+    if (changed) Lampa.Storage.set('tvt_sync_eps', all);
+  }
+
+  function rememberEpisodes(movie, seasons) {
+    var n = {};
+
+    seasons.forEach(function (s) { if (s.episode_count) n[s.season_number] = s.episode_count; });
+    addEpTitles([{ key: cardKey(movie), o: movie.original_title, n: n }]);
+  }
+
+  // Сериал из закладок, который экран сериала ещё не открывал (отметки до этой версии плагина): сезоны и
+  // серии ищем по самим записям, пока после последней найденной серии не пойдут 150 пустых номеров
+  function scanEpisodes(o, views) {
+    var n = {};
+    var empty = 0;
+
+    for (var s = 0; s <= 40 && empty < 4; s++) {
+      var last = 0;
+
+      for (var e = 1; e <= last + 150; e++) {
+        if (views[epHash(o, s, e)]) last = e;
+      }
+
+      if (last) {
+        n[s] = last;
+        empty = 0;
+      } else if (s) empty++;
+    }
+
+    return n;
+  }
+
+  function packViews(views) {
+    var fav = Lampa.Favorite.full ? Lampa.Favorite.full() : null;
+    var reg = readJson('tvt_sync_eps');
+    var fresh = [];
+
+    ((fav && fav.card) || []).forEach(function (c) {
+      var o = c.original_title || c.original_name;
+
+      if (c.original_name && o && !reg[cardKey(c)]) fresh.push({ key: cardKey(c), o: o, n: scanEpisodes(o, views) });
+    });
+
+    if (fresh.length) {
+      addEpTitles(fresh);
+      reg = readJson('tvt_sync_eps');
+    }
+
+    var covered = {};
+    var seen = {};
+
+    for (var key in reg) {
+      var o = reg[key].o;
+      var seasons = null;
+
+      for (var s in reg[key].n) {
+        var runs = [];
+        var run = null;
+
+        for (var e = 1; e <= reg[key].n[s]; e++) {
+          var h = epHash(o, +s, e);
+          var v = views[h];
+
+          if (!v || !isBare(v) || covered[h]) {
+            run = null;
+            continue;
+          }
+
+          // Время отрезка — самое раннее: на другом устройстве отметка не окажется новее, чем была
+          if (run && Math.abs((v.u || 0) - run[2]) <= SYNC_RUN_GAP) {
+            run[1] = e;
+            run[2] = Math.min(run[2], v.u || 0);
+          } else {
+            runs.push(run = [e, e, v.u || 0]);
+          }
+
+          covered[h] = true;
+        }
+
+        if (runs.length) (seasons = seasons || {})[s] = runs;
+      }
+
+      if (seasons) seen[key] = { o: o, s: seasons };
+    }
+
+    var out = {};
+    var w = {};
+    var old = Date.now() - SYNC_FORGET;
+
+    for (var k in views) {
+      var x = views[k];
+
+      if (covered[k]) continue;
+      if (isBare(x)) w[k] = x.u || 0;
+      // «Сброшено» (отметку сняли) — 60 дней, как удалённые закладки
+      else if (x.p || x.t || (x.u || 0) > old) out[k] = x;
+    }
+
+    // Лимит: сначала отрезаются самые старые отметки без позиции, потом старые «сброшено»; начатые серии — никогда
+    var extra = Object.keys(out).length + Object.keys(w).length - SYNC_MAX_VIEWS;
+
+    if (extra > 0) {
+      Object.keys(w).sort(function (a, b) { return w[a] - w[b]; }).slice(0, extra).forEach(function (h) {
+        delete w[h];
+        extra--;
+      });
+
+      Object.keys(out).filter(function (h) { return !out[h].p && !out[h].t; }).sort(function (a, b) {
+        return (out[a].u || 0) - (out[b].u || 0);
+      }).slice(0, Math.max(0, extra)).forEach(function (h) { delete out[h]; });
+    }
+
+    return { views: out, w: w, seen: seen };
+  }
+
+  // Файл устройства → записи серий, как в Lampa: сводка и отметки одним числом разворачиваются обратно
+  function unpackState(file) {
+    if (!file || typeof file !== 'object') return file;
+
+    var views = {};
+    var reg = [];
+    var put = function (h, v) { if (!views[h] || (views[h].u || 0) < v.u) views[h] = v; };
+    var k;
+
+    for (k in file.w || {}) put(k, { p: 100, t: 0, d: 0, u: file.w[k] });
+
+    for (k in file.seen || {}) {
+      var o = file.seen[k].o;
+      var list = file.seen[k].s || {};
+      var n = {};
+
+      if (!o) continue;
+
+      for (var s in list) {
+        (list[s] || []).forEach(function (r) {
+          for (var e = r[0]; e <= r[1] && e <= 5000; e++) put(epHash(o, +s, e), { p: 100, t: 0, d: 0, u: r[2] });
+
+          n[s] = Math.max(n[s] || 0, r[1]);
+        });
+      }
+
+      reg.push({ key: k, o: o, n: n });
+    }
+
+    for (k in file.views || {}) views[k] = file.views[k];
+
+    if (reg.length) addEpTitles(reg);
+
+    file.views = views;
+
+    return file;
+  }
+
   // Закладки без отметок времени, поэтому ведём журнал: что добавилось или пропало с прошлого раза
   function trackMarks() {
     var fav = Lampa.Favorite.full ? Lampa.Favorite.full() : null;
@@ -5519,19 +5712,10 @@
 
   // Файл устройства: всё известное ему состояние (карточки — только для действующих закладок)
   function deviceFile(cfg, merged) {
-    var views = {};
-    var keys = Object.keys(merged.views);
-
-    if (keys.length > SYNC_MAX_VIEWS) {
-      keys.sort(function (a, b) { return (merged.views[b].u || 0) - (merged.views[a].u || 0); });
-      keys = keys.slice(0, SYNC_MAX_VIEWS);
-    }
-
-    keys.forEach(function (h) { views[h] = merged.views[h]; });
-
+    var packed = packViews(merged.views);
     var cards = {};
     var marks = {};
-    var old = Date.now() - 60 * 86400000;
+    var old = Date.now() - SYNC_FORGET;
 
     for (var k in merged.marks) {
       var m = merged.marks[k];
@@ -5549,7 +5733,7 @@
       if (merged.cards[id]) cards[id] = slimCard(merged.cards[id]);
     }
 
-    return { v: 1, device: cfg.device, name: cfg.name, views: views, marks: marks, cards: cards, titles: merged.titles };
+    return { v: 2, device: cfg.device, name: cfg.name, views: packed.views, w: packed.w, seen: packed.seen, marks: marks, cards: cards, titles: merged.titles };
   }
 
   function syncStatus(text) {
@@ -5633,7 +5817,7 @@
 
           gh(cfg, 'GET', base + '/' + encodeURIComponent(f.name), null, function (json) {
             try {
-              remote.push(JSON.parse(b64decode(json.content)));
+              remote.push(unpackState(JSON.parse(b64decode(json.content))));
               seen[f.path] = f.sha;
             } catch (e) {
               console.warn('TV Torrents', 'sync: bad file', f.path, e);
@@ -6437,6 +6621,7 @@
     store: { ready: function () { return !!syncConfig(); }, get: storeGet, put: storePut, info: storeInfo },
     openSeason: function (id, season) { window.tvt_season_hint = { id: id, season: season, t: Date.now() }; },
     subs: { release: releaseSubs, forPlayer: subForPlayer, episodeNo: fileEpisodeNo, online: onlineSubs, targets: osTargets, parse: osParse },
+    syncFile: { pack: packViews, unpack: unpackState },
     version: VERSION
   };
 
